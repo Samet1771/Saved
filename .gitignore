@@ -11,3 +11,7 @@ data-*/
 
 # Dev-only sample media
 web/dev/media/
+
+# Desktop app
+desktop/src-tauri/target/
+desktop/node_modules/
