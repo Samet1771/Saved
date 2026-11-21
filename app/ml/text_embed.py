@@ -20,9 +20,9 @@ def load(half=False):
         import torch
         from sentence_transformers import SentenceTransformer
         torch.set_num_threads(settings.threads)
-        _model = SentenceTransformer(settings.text_model, device="cpu")
+        _model = SentenceTransformer(settings.text_model, device=settings.device)
         _model.max_seq_length = 2048
-        if half:
+        if half or settings.device == "cuda":
             _model = _model.to(torch.bfloat16)
         loads, load_s = loads + 1, time.perf_counter() - t
     return _model

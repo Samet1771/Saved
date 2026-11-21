@@ -48,9 +48,10 @@ def ocr_lines(frames):
     return out
 
 
-def process(conn, item):
-    d = item_dir(item["shortcode"])
-    media = json.loads(item["media"])
+def compute(item, d):
+    """Run speech and OCR on the item's media in directory d; returns the fields to store (keyframes are written to d)."""
+    d = Path(d)
+    media = json.loads(item["media"]) if isinstance(item["media"], str) else item["media"]
     segments, lang, frames, lines = [], None, [], []
     for idx, m in enumerate(media):
         path = d / m["file"]
@@ -65,8 +66,13 @@ def process(conn, item):
         with tempfile.TemporaryDirectory() as tmp:
             lines += ocr_lines(sample_frames(path, tmp))
     ocr_text = ocr_ml.dedupe_lines(x for _, x in lines)
-    update_item(
-        conn, item["id"], status="extracted", transcript=segments,
-        transcript_text=" ".join(s["text"] for s in segments) or None, lang=lang,
-        ocr_text=ocr_text or None, ocr_lines=lines, keyframes=frames, error=None, failed_stage=None,
-    )
+    return {"transcript": segments, "transcript_text": " ".join(s["text"] for s in segments) or None, "lang": lang,
+            "ocr_text": ocr_text or None, "ocr_lines": lines, "keyframes": frames}
+
+
+def store(conn, item_id, fields):
+    update_item(conn, item_id, status="extracted", error=None, failed_stage=None, **fields)
+
+
+def process(conn, item):
+    store(conn, item["id"], compute(item, item_dir(item["shortcode"])))

@@ -92,7 +92,7 @@ async function loadStatus() {
   }
   renderActivity(s);
   updateBusy(s);
-  el.querySelector('#s-models .remote').innerHTML = remoteHTML(s.worker || {});
+  el.querySelector('#s-models .remote').innerHTML = s.compute?.mode === 'hybrid' ? computeHTML(s.compute.agent || {}) : remoteHTML(s.worker || {});
   const c = s.counts || {};
   const d = s.disk || {};
   const w = s.worker || {};
@@ -117,6 +117,14 @@ async function loadStatus() {
         <a class="btn sm ghost" href="#/item/${+x.id}">Open</a>
         ${RETRYABLE.has(x.status) ? `<button type="button" class="btn sm" data-retry="${+x.id}">${icon('retry', 'sm')}Retry</button>` : ''}</li>`).join('')}</ul>`
     : '<p>No failed, private, login-only or deleted items.</p>';
+}
+
+function computeHTML(a) {
+  const seen = a.seen ? ` · last seen ${esc(fmtAgo(a.seen))}` : '';
+  const busy = a.leased ? ` · working on ${+a.leased}` : '';
+  return a.online
+    ? `<p><span class="status-pill st-indexed">PC compute online</span> ${esc(a.name || '')}${busy}${seen}. Hybrid mode: the PC does extract, tagging and indexing.</p>`
+    : `<p><span class="status-pill st-failed">PC compute offline</span>${seen}. Hybrid mode: new items are downloaded and wait here until PC compute runs.</p>`;
 }
 
 function remoteHTML(w) {

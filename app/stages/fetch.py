@@ -23,6 +23,14 @@ class RateLimited(Exception):
     pass
 
 
+class NetworkDown(Exception):
+    """The server can't reach Instagram at all (DNS, routing): not the item's fault."""
+
+
+NETWORK_DOWN = re.compile(r"name resolution|failed to resolve|network is unreachable|no route to host|"
+                          r"connection refused|temporary failure|getaddrinfo failed|nodename nor servname", re.I)
+
+
 RATE_LIMIT = re.compile(r"rate-?limit|\b429\b|too many requests|please wait a few minutes", re.I)
 RESTRICTED_MSG = "restricted: needs login"
 NEEDS_LOGIN_MSG = "needs login: Instagram only serves photo posts to logged-in users; add burner cookies"
@@ -191,6 +199,8 @@ def process(conn, item):
             last = e
     else:
         shutil.rmtree(d, ignore_errors=True)
+        if NETWORK_DOWN.search(str(last)):
+            raise NetworkDown(first_line(last)[:300]) from last
         status = classify(str(last), has_cookies)
         if status == "rate_limited":
             raise RateLimited(first_line(last)[:500]) from last

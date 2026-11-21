@@ -17,8 +17,15 @@ class Settings:
         self.web_dir = Path(_env("WEB_DIR", str(Path(__file__).resolve().parent.parent / "web")))
         self.api_token = _env("API_TOKEN", "")
         self.auth_disabled = _env("AUTH_DISABLED", "0") == "1"
+        self.compute_mode = _env("COMPUTE_MODE", "server").lower()
+        if self.compute_mode not in ("server", "hybrid"):
+            raise ValueError("COMPUTE_MODE must be server or hybrid")
+        self.device = _env("DEVICE", "cpu").lower()
+        self.work_lease_s = float(_env("WORK_LEASE_S", 900))
+        self.agent_timeout_s = float(_env("AGENT_TIMEOUT_S", 90))
         self.fetch_delay_min = float(_env("FETCH_DELAY_MIN", 20))
         self.fetch_delay_max = float(_env("FETCH_DELAY_MAX", 40))
+        self.fetch_slots = max(1, int(_env("FETCH_SLOTS", 1)))
         self.min_free_gb = float(_env("MIN_FREE_GB", 5))
         self.batch_window = _env("BATCH_WINDOW", "01:00-07:00")
         self.tz = _env("TZ", "Europe/Istanbul")

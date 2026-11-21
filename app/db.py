@@ -159,6 +159,10 @@ MIGRATIONS = [
     """
     CREATE TABLE sessions (token_hash TEXT PRIMARY KEY, label TEXT, created_at TEXT NOT NULL);
     """,
+    """
+    ALTER TABLE items ADD COLUMN lease_until TEXT;
+    ALTER TABLE items ADD COLUMN leased_by TEXT;
+    """,
 ]
 
 EVENTS_KEEP = 2000

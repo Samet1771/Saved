@@ -46,10 +46,14 @@ def apply_result(conn, item, result, model=None):
     update_item(conn, item["id"], **fields)
 
 
-def frames(item, tmp):
+def _json(v, default):
+    return v if isinstance(v, (list, dict)) else json.loads(v or default)
+
+
+def frames(item, tmp, d=None):
     """[(label, path)]: videos at settings.vlm_fps with timestamps, photos as-is."""
-    d = item_dir(item["shortcode"])
-    media = json.loads(item["media"] or "[]")
+    d = Path(d) if d else item_dir(item["shortcode"])
+    media = _json(item["media"], "[]")
     multi = len(media) > 1
     out = []
     for idx, m in enumerate(media):
@@ -67,15 +71,15 @@ def frames(item, tmp):
 
 
 def prompt_text(item, categories, nframes):
-    media = json.loads(item["media"] or "[]")
+    media = _json(item["media"], "[]")
     duration = sum(m.get("duration") or 0 for m in media if m["kind"] == "video")
-    segments = json.loads(item["transcript"] or "[]")
+    segments = _json(item["transcript"], "[]")
     if not any(m.get("audio") for m in media):
         speech = "Speech transcript (automatic):\n(no audio)"
     else:
         body = "\n".join(f"[{s['start']:.1f}-{s['end']:.1f}] {s['text']}" for s in segments) or "(no speech detected)"
         speech = f"Speech transcript (automatic, language {item['lang']}):\n{body}"
-    lines = json.loads(item["ocr_lines"] or "[]")
+    lines = _json(item["ocr_lines"], "[]")
     if lines:
         ocr = "\n".join(f"[{t:.1f}] {x}" if t is not None else f"[photo] {x}" for t, x in lines)
     else:
@@ -86,8 +90,15 @@ def prompt_text(item, categories, nframes):
             f"Categories: {', '.join(categories)}, other")
 
 
+def compute(item, categories, d, backend="remote"):
+    """Ask the model about the item's media in directory d; returns its parsed answer."""
+    with tempfile.TemporaryDirectory() as tmp:
+        pics = llm.pick_frames(frames(item, Path(tmp), d))
+        return llm.enrich(prompt_text(item, categories, len(pics)), pics, backend)
+
+
 def process(conn, item):
-    local_ok = settings.llm_local_fallback and item["source"] == "ingest"
+    local_ok = llm.local_allowed(item["source"])
     if not llm.remote_healthy() and not local_ok:
         raise Waiting("remote GPU unreachable, waiting for it")
     categories = get_categories(conn)

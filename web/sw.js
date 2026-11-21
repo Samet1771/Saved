@@ -1,5 +1,5 @@
 // App-shell cache only. /api and /media are never cached.
-const CACHE = 'saved-shell-v4';
+const CACHE = 'saved-shell-v5';
 const SHELL = [
   './', 'index.html', 'styles.css', 'app.js', 'manifest.webmanifest',
   'js/api.js', 'js/util.js', 'js/store.js', 'js/router.js', 'js/library.js', 'js/reorder.js',

@@ -44,12 +44,14 @@ The pipeline was chosen with a benchmark on 20 real reels: 7 speech models, 6 OC
 |---|---|---|
 | `API_TOKEN` | empty | Optional fixed bearer token for scripts, accepted next to sign-in sessions |
 | `AUTH_DISABLED` | `0` | `1` turns authentication off (local development only) |
+| `COMPUTE_MODE` | `server` | `server`: everything on the server. `hybrid`: a GPU PC does extract, enrich and index through `/api/work/*`; the server only fetches. `setup.sh` asks |
 | `DATA_DIR` | `/data` | `vault.db`, `models/`, `secrets/` |
 | `MEDIA_DIR` | `$DATA_DIR/media` | Downloaded media (`<shortcode>/0.mp4`, `thumb.jpg`, keyframes) |
 | `MEDIA_HOST_DIR` | `./data/media` | compose only: host directory mounted at `/media` |
 | `TZ` | `Europe/Istanbul` | Time zone of `BATCH_WINDOW` |
 | `BATCH_WINDOW` | `01:00-07:00` | `HH:MM-HH:MM` (may wrap midnight), `always` or `never` |
-| `FETCH_DELAY_MIN` / `MAX` | `20` / `40` | Random delay between export fetches, in seconds |
+| `FETCH_DELAY_MIN` / `MAX` | `20` / `40` | Random pause after each fetch, per download slot, in seconds |
+| `FETCH_SLOTS` | `1` | Downloads running at once. They share one rate-limit back-off: a 429 pauses all of them |
 | `MIN_FREE_GB` | `5` | Fetching pauses below this much free space on the media disk |
 | `THREADS` | `4` | CPU threads for Whisper, OCR and torch |
 | `WHISPER_MODEL` | `deepdml/faster-whisper-large-v3-turbo-ct2` | CTranslate2 large-v3-turbo (int8 at load time) |
@@ -99,19 +101,17 @@ Hugging Face models download on first use into `DATA_DIR/models` (`HF_HOME`).
    # /srv/saved already holds the two mount points, so clone elsewhere and copy in:
    git clone https://github.com/Samet1771/Saved.git /tmp/saved && cp -a /tmp/saved/. /srv/saved/
    cd /srv/saved
-   cp .env.example .env    # set MEDIA_HOST_DIR=/srv/saved/media, LLM_REMOTE_URL and LLM_REMOTE_KEY
-   mkdir -p data/models data/secrets
+   cp .env.example .env    # set MEDIA_HOST_DIR=/srv/saved/media
    ```
-4. Start the GPU side on your PC ([tools/pc-llm](tools/pc-llm/README.md)).
-5. Build and start:
+4. Run the setup. It asks where processing should run, downloads only that mode's models, builds and starts the containers, and creates your sign-in account:
    ```bash
-   docker compose up -d --build
+   ./setup.sh
    ```
-   Then create your account (it asks for a username and a password):
-   ```bash
-   docker compose exec api python -m app.auth set-password
-   ```
-   Run it again to change the password. `python -m app.auth sign-out-all` revokes every session.
+   - **Server only:** everything runs on the server's CPU. No PC needed, but each reel takes minutes.
+   - **Hybrid:** a Windows PC with an NVIDIA GPU does extract, enrich and index ([tools/pc-compute](tools/pc-compute/README.md), or the desktop app's PC compute card). The server only fetches, stores, serves and searches. Items wait while the PC is off.
+
+   Change the mode later with `./setup.sh --reconfigure`. Change the password with `docker compose exec api python -m app.auth set-password`; `python -m app.auth sign-out-all` revokes every session.
+5. Hybrid only: start PC compute on the GPU PC (see [tools/pc-compute](tools/pc-compute/README.md)).
 6. Import your saves: in Instagram, request **Download your information** in **JSON** format. Then use the import button in the UI, or:
    ```bash
    TOKEN=$(curl -s -H 'Content-Type: application/json' -d '{"username":"<you>","password":"<password>"}' \

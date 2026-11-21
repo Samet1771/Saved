@@ -4,6 +4,7 @@ import random
 import shutil
 import signal
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 from . import db
@@ -11,7 +12,7 @@ from .config import in_batch_window, settings
 from .ml import llm
 from .stages import enrich, extract, fetch, index
 from .stages.enrich import Waiting
-from .stages.fetch import RateLimited, Terminal, first_line
+from .stages.fetch import NetworkDown, RateLimited, Terminal, first_line
 
 log = logging.getLogger("worker")
 
@@ -21,6 +22,7 @@ PENDING = tuple(s[1] for s in STAGES)
 MAX_ATTEMPTS = 3
 BACKOFF = [15 * 60, 30 * 60, 60 * 60, 2 * 60 * 60]
 MAX_RATE_LIMITED = 3
+NETWORK_RETRY_S = 60
 
 
 def fmt_duration(s):
@@ -65,7 +67,8 @@ def model_label(model):
 class Worker:
     def __init__(self, conn, stages=None, clock=time.monotonic, sleep=time.sleep):
         self.conn = conn
-        self.stages = stages or STAGES
+        self.stages = stages or (STAGES[:1] if settings.compute_mode == "hybrid" else STAGES)
+        self.pending = tuple(s[1] for s in self.stages)
         self.clock, self.sleep = clock, sleep
         self.stop = False
         self.next_fetch = 0.0
@@ -75,6 +78,11 @@ class Worker:
         self.backoff_until = None
         self.cookies_mtime = None
         self.remote_up = None
+        self.net_down = False
+        self.net_retry = 0.0
+        self.slots = [0.0] * settings.fetch_slots
+        self.inflight = {}
+        self.pool = ThreadPoolExecutor(settings.fetch_slots, "fetch") if settings.fetch_slots > 1 else None
         self._restore_backoff()
 
     def _row(self, item_id):
@@ -102,42 +110,65 @@ class Worker:
             if getattr(m, "loads", 0) != before.get(id(m), 0) and m.load_s is not None:
                 self.event(name, f"loaded {model_label(m)} in {m.load_s:.1f} s", duration=m.load_s)
 
-    def run_item(self, name, module, item_id):
+    def begin_item(self, name, item_id):
         item = self._row(item_id)
         attempts = item["attempts"] + 1
         if attempts > MAX_ATTEMPTS:
             msg = f"worker stopped during {name} {MAX_ATTEMPTS} times (crash or out of memory?)"
             db.update_item(self.conn, item_id, status="failed", failed_stage=name, attempts=0, error=msg)
             self.event(name, f"failed: {msg}", "error", item)
-            return False
+            return None
         db.update_item(self.conn, item_id, attempts=attempts)
         db.set_worker(self.conn, name, item_id)
+        return item
+
+    def run_item(self, name, module, item_id):
+        item = self.begin_item(name, item_id)
+        if item is None:
+            return False
         loads = self._model_loads(module)
         t0 = time.perf_counter()
-        ok = False
         try:
             module.process(self.conn, self._row(item_id))
+            err = None
+        except Exception as e:
+            err = e
+        try:
+            return self.finish_item(name, item, err, t0)
+        finally:
+            self._report_loads(name, module, loads)
+            db.set_worker(self.conn, "idle")
+            self.check_remote()
+
+    def finish_item(self, name, item, err, t0):
+        item_id = item["id"]
+        try:
+            if err is not None:
+                raise err
             db.update_item(self.conn, item_id, attempts=0)
             self.event(name, done_message(name, self._row(item_id)), item=item, duration=time.perf_counter() - t0)
-            ok = True
+            return True
         except Waiting:
             db.update_item(self.conn, item_id, attempts=0)
+        except NetworkDown as e:
+            db.update_item(self.conn, item_id, attempts=0)
+            self.net_retry = self.clock() + NETWORK_RETRY_S
+            self.next_fetch = max(self.next_fetch, self.net_retry)
+            if not self.net_down:
+                self.event(name, f"network down, retrying every {NETWORK_RETRY_S} s: {e}", "warn", item)
+            self.net_down = True
         except RateLimited as e:
             self.rate_limited(name, item, e, time.perf_counter() - t0)
         except Terminal as e:
             db.update_item(self.conn, item_id, status=e.status, error=str(e)[:1000], failed_stage=name, attempts=0)
             self.event(name, f"{e.status}: {first_line(e)[:200]}", "warn", item, time.perf_counter() - t0)
         except Exception as e:
-            log.exception("%s failed for item %s", name, item_id)
+            log.error("%s failed for item %s", name, item_id, exc_info=e)
             db.update_item(self.conn, item_id, status="failed", error=f"{type(e).__name__}: {e}"[:1000],
                            failed_stage=name, attempts=0)
             self.event(name, f"failed: {type(e).__name__}: {first_line(e)[:200]}", "error", item,
                        time.perf_counter() - t0)
-        finally:
-            self._report_loads(name, module, loads)
-            db.set_worker(self.conn, "idle")
-            self.check_remote()
-        return ok
+        return False
 
     def rate_limited(self, name, item, err, duration):
         hits = item["rate_limited"] + 1
@@ -149,7 +180,7 @@ class Worker:
             db.update_item(self.conn, item["id"], status="failed", error=msg[:1000], failed_stage=name, attempts=0,
                            rate_limited=0)
             self.event(name, f"failed: {msg[:200]}", "error", item, duration)
-        if self.backoff_until is None or item["source"] == "export":
+        if self.backoff_until is None or (item["source"] == "export" and self.clock() >= self.backoff_until):
             self.start_backoff()
 
     def start_backoff(self):
@@ -171,6 +202,9 @@ class Worker:
         return False
 
     def fetch_succeeded(self):
+        if self.net_down:
+            self.net_down = False
+            self.event("fetch", "network is back")
         if self.backoff_level or self.backoff_until is not None:
             self.backoff_level, self.backoff_until = 0, None
             db.set_fetch_backoff(self.conn, None)
@@ -224,10 +258,10 @@ class Worker:
         db.set_llm_status(self.conn, healthy, st["checked_at"], st["model"], backend)
 
     def ingest_waiting(self):
-        excluded = ("queued",) if self.paused or self.held["fetch_paused"] else ()
+        excluded = ("queued",) if self.paused or self.held["fetch_paused"] or self.pool else ()
         if not llm.can_enrich():
             excluded += ("extracted",)
-        statuses = [s for s in PENDING if s not in excluded]
+        statuses = [s for s in self.pending if s not in excluded]
         return self.conn.execute(
             f"SELECT id FROM items WHERE source='ingest' AND status IN ({','.join('?' * len(statuses))})"
             " ORDER BY id LIMIT 1", statuses).fetchone()
@@ -238,7 +272,7 @@ class Worker:
         for name, from_status, module in self.stages:
             if self.stop:
                 break
-            if name == "fetch" and (self.paused or self.held["fetch_paused"]):
+            if name == "fetch" and (self.paused or self.held["fetch_paused"] or self.clock() < self.net_retry):
                 continue
             ids = [r[0] for r in self.conn.execute(
                 "SELECT id FROM items WHERE source='ingest' AND status=? ORDER BY id", (from_status,))]
@@ -247,11 +281,15 @@ class Worker:
                     break
                 if self.run_item(name, module, item_id) and name == "fetch":
                     self.fetch_succeeded()
+                if name == "fetch" and self.net_down:
+                    break
             if ids:
                 self.unload(module)
         return True
 
     def enrich_remote(self):
+        if not any(s[0] == "enrich" for s in self.stages):
+            return False
         name, _, module = next(s for s in self.stages if s[0] == "enrich")
         tried, done = set(), 0
         backlog = self.conn.execute("SELECT COUNT(*) FROM items WHERE status='extracted' AND source='export'"
@@ -274,6 +312,8 @@ class Worker:
         return bool(tried)
 
     def maybe_fetch(self):
+        if self.pool:
+            return self.pump_fetches()
         if self.clock() < self.next_fetch or self.backoff_active():
             return False
         self.set_paused(not fetch.disk_free_ok())
@@ -289,6 +329,57 @@ class Worker:
             self.fetch_succeeded()
         self.next_fetch = self.clock() + random.uniform(settings.fetch_delay_min, settings.fetch_delay_max)
         return True
+
+    def _fetch_job(self, module, item_id):
+        conn = db.connect()
+        try:
+            module.process(conn, conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone())
+            return None
+        except Exception as e:
+            return e
+        finally:
+            conn.close()
+
+    def collect_fetches(self, wait=False):
+        done = 0
+        for fut, (slot, item, t0) in list(self.inflight.items()):
+            if not (wait or fut.done()):
+                continue
+            del self.inflight[fut]
+            if self.finish_item("fetch", item, fut.result(), t0):
+                self.fetch_succeeded()
+            self.slots[slot] = max(self.slots[slot], self.clock() + random.uniform(settings.fetch_delay_min,
+                                                                                  settings.fetch_delay_max))
+            done += 1
+        if done and not self.inflight:
+            db.set_worker(self.conn, "idle")
+        return done
+
+    def pump_fetches(self):
+        """Keep up to FETCH_SLOTS downloads running, each slot pausing FETCH_DELAY_MIN..MAX after its last one."""
+        worked = self.collect_fetches() > 0
+        if self.backoff_active() or self.clock() < self.net_retry:
+            return worked
+        self.set_paused(not fetch.disk_free_ok())
+        if self.paused or self.held["fetch_paused"]:
+            return worked
+        busy = {slot for slot, _, _ in self.inflight.values()}
+        free = [s for s in range(len(self.slots)) if s not in busy and self.clock() >= self.slots[s]]
+        if not free:
+            return worked
+        taken = [item["id"] for _, item, _ in self.inflight.values()]
+        rows = self.conn.execute(
+            f"SELECT id FROM items WHERE status='queued' AND id NOT IN ({','.join('?' * len(taken)) or '-1'})"
+            " ORDER BY source='ingest' DESC, rate_limited, id LIMIT ?", (*taken, len(free))).fetchall()
+        name, _, module = self.stages[0]
+        for slot, row in zip(free, rows):
+            item = self.begin_item(name, row["id"])
+            if item is None:
+                continue
+            fut = self.pool.submit(self._fetch_job, module, row["id"])
+            self.inflight[fut] = (slot, item, time.perf_counter())
+            worked = True
+        return worked
 
     def run_batches(self):
         worked = False
@@ -360,9 +451,12 @@ class Worker:
                 log.exception("worker tick failed")
                 worked = False
             if not worked:
-                end = self.clock() + settings.idle_sleep
+                end = self.clock() + (1 if self.inflight else settings.idle_sleep)
                 while not self.stop and self.clock() < end:
                     self.sleep(0.5)
+        if self.pool:
+            self.collect_fetches(wait=True)
+            self.pool.shutdown()
         db.set_worker(self.conn, "idle")
         log.info("worker stopped")
 

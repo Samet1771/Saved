@@ -20,7 +20,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from pydantic import BaseModel
 
 from . import auth as accounts
-from . import db, importer
+from . import db, importer, work
 from .config import in_batch_window, settings, valid_window
 from .ml import llm
 from .search import search, unload_if_idle
@@ -653,6 +653,7 @@ def status_payload(conn):
         "controls": {**held, "batch_window_default": settings.batch_window,
                      "batch_window_effective": held["batch_window"] or settings.batch_window},
         "system": {**system_stats(), "worker_rss_mb": w["rss_mb"]},
+        "compute": {"mode": settings.compute_mode, "agent": work.agent_status(conn)},
         "last_errors": [dict(r) for r in conn.execute(
             "SELECT id, shortcode, status, error FROM items WHERE status IN ('failed', 'private', 'gone', 'needs_login')"
             " ORDER BY updated_at DESC, id DESC LIMIT 20")],
@@ -867,6 +868,7 @@ def reenrich(body: ReenrichBody = ReenrichBody(), conn=Depends(get_conn)):
 
 
 app.include_router(api)
+app.include_router(work.router, prefix="/api", dependencies=[Depends(auth)])
 
 SSE_POLL_S = 1.0
 SSE_STATUS_EVERY = 5

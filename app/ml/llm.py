@@ -210,8 +210,17 @@ def unload():
         proc.wait()
 
 
+def local_allowed(source):
+    """Whether this item may use the server's CPU model."""
+    if settings.compute_mode == "server" and not settings.llm_remote_url:
+        return True
+    return settings.llm_local_fallback and source == "ingest"
+
+
 def can_enrich():
-    return remote_healthy() or settings.llm_local_fallback
+    if settings.compute_mode == "hybrid":
+        return False
+    return remote_healthy() or settings.llm_local_fallback or local_allowed("export")
 
 
 def pick_frames(frames, limit=None):

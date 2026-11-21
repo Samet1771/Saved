@@ -254,6 +254,26 @@ Re-enrich:
 - Reset items are also moved to `source: export`, so they wait for the remote GPU instead of being tagged one by one on the CPU as ingest items.
 - Tags, category and summary stay visible until the item is re-tagged. Manual category and tags are never overwritten.
 
+### Work (hybrid mode)
+
+With `COMPUTE_MODE=hybrid` the server only fetches, stores, serves and searches. A PC agent ([tools/pc-compute](tools/pc-compute/README.md)) does extract, enrich and index on its GPU through these routes. All need the bearer token; `claim` answers 409 in `server` mode.
+
+| Method + path | Body | Returns |
+|---|---|---|
+| `POST /api/work/claim` | `{agent, stage: extract\|enrich\|index, limit?, info?}` | `{items: [Item], lease_until, categories?}`; `{items: [], paused: true}` while the worker is paused |
+| `POST /api/work/heartbeat` | `{agent, info?}` | `{mode, paused}` |
+| `POST /api/work/release` | `{ids}` | `{released}`: give leases back (agent shutdown) |
+| `POST /api/work/{id}/extract` | multipart: `fields` (JSON: `transcript, transcript_text, lang, ocr_text, ocr_lines, keyframes`), `files` (each keyframe as `kf<media>_<n>.jpg`, ≤2 MB), `duration_s?` | `{status: "extracted"}` |
+| `POST /api/work/{id}/enrich` | `{result, model?, duration_s?}`: `result` is the model's JSON answer (same schema as the server's own enrich) | `{status: "enriched"}` |
+| `POST /api/work/{id}/index` | `{text_vec: [768] \| null, visual: [[768], …], duration_s?}` | `{status: "indexed"}` |
+| `POST /api/work/{id}/fail` | `{stage, error, duration_s?}` | `{status: "failed"}` |
+
+- **Item** is the stored row with JSON columns decoded: `id, shortcode, source, type, status, url, author, caption, lang, transcript_text, ocr_text, summary, description, category, media, transcript, ocr_lines, keyframes, tags, details, hashtags`. Media files are at `/media/{shortcode}/{media[i].file}`.
+- `claim` hands out items in the stage's input status (`fetched`, `extracted`, `enriched`), Siri links first, and leases them for `WORK_LEASE_S` (900 s). Expired leases are claimable again.
+- A result for an item that is no longer in the stage's input status answers 409 (the user retried or edited it); drop it.
+- `extract` and `index` are computed with the same code as the server (`app.stages.extract.compute`, `app.stages.index.compute`, `app.stages.enrich.compute`) so results match.
+- The agent counts as online for `AGENT_TIMEOUT_S` (90 s) after its last claim or heartbeat. `GET /api/status` reports it under `compute: {mode, agent: {name, seen, online, info, leased}}`.
+
 ### Media
 
 `GET /media/{shortcode}/{file}` serves the file with HTTP Range support (needed for seeking and iOS Safari playback).

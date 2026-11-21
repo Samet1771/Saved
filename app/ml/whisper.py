@@ -16,7 +16,8 @@ def load():
     if _model is None:
         t = time.perf_counter()
         from faster_whisper import WhisperModel
-        _model = WhisperModel(settings.whisper_model, device="cpu", compute_type="int8",
+        gpu = settings.device == "cuda"
+        _model = WhisperModel(settings.whisper_model, device=settings.device, compute_type="float16" if gpu else "int8",
                               cpu_threads=settings.threads, download_root=str(settings.models_dir / "whisper"))
         loads, load_s = loads + 1, time.perf_counter() - t
     return _model

@@ -1,3 +1,4 @@
+import os
 import re
 
 MIN_SCORE = 0.85
@@ -11,7 +12,13 @@ def load():
     global _engine
     if _engine is None:
         from rapidocr import RapidOCR
-        _engine = RapidOCR(params={"Global.log_level": "warning"})
+
+        from ..config import settings
+        params = {"Global.log_level": "warning"}
+        if settings.device == "cuda" and os.environ.get("OCR_GPU") == "1":
+            params["EngineConfig.onnxruntime.use_cuda"] = True
+            params["EngineConfig.onnxruntime.cuda_ep_cfg.cudnn_conv_algo_search"] = "HEURISTIC"
+        _engine = RapidOCR(params=params)
     return _engine
 
 
