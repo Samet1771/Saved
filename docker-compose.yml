@@ -1,0 +1,30 @@
+x-common: &common
+  build: .
+  image: saved:latest
+  restart: unless-stopped
+  env_file: .env
+  environment:
+    DATA_DIR: /data
+    MEDIA_DIR: /media
+    HF_HOME: /data/models
+  volumes:
+    - ./data:/data
+    - ${MEDIA_HOST_DIR:-./data/media}:/media
+
+services:
+  api:
+    <<: *common
+    ports:
+      - "8080:8080"
+    environment:
+      DATA_DIR: /data
+      MEDIA_DIR: /media
+      HF_HOME: /data/models
+      API_TOKEN: ${API_TOKEN:?set API_TOKEN in .env}
+    mem_limit: 3g
+
+  worker:
+    <<: *common
+    command: ["python", "-m", "app.worker"]
+    mem_limit: 3500m
+    stop_grace_period: 120s

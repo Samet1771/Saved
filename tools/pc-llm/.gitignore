@@ -1,0 +1,6 @@
+llama/
+models/
+key.txt
+server.log
+llama-cuda/
+paths.local.ps1
