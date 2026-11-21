@@ -4,3 +4,4 @@ key.txt
 server.log
 llama-cuda/
 paths.local.ps1
+crashes.log

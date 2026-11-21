@@ -61,6 +61,20 @@ $Paths = foreach ($m in $Models) {
 
 # llama-server logs to stderr; with 'Stop', Windows PowerShell treats redirected stderr as a fatal error.
 $ErrorActionPreference = 'Continue'
-Write-Host "Serving $($Paths[0]) on port $Port (Ctrl+C to stop)"
-& $Server -m $Paths[0] --mmproj $Paths[1] `
-    -ngl 99 -c 65536 -np 1 --host 0.0.0.0 --port $Port --api-key $Key --no-webui --reasoning off
+$CrashLog = Join-Path $PSScriptRoot 'crashes.log'
+$Restarts = @()
+while ($true) {
+    Write-Host "Serving $($Paths[0]) on port $Port (Ctrl+C to stop)"
+    & $Server -m $Paths[0] --mmproj $Paths[1] `
+        -ngl 99 -c 65536 -np 1 --host 0.0.0.0 --port $Port --api-key $Key --no-webui --reasoning off
+    $code = $LASTEXITCODE
+    Add-Content -Path $CrashLog -Value "$(Get-Date -Format s) llama-server exited with code $code"
+    # Restart after a crash so tagging keeps going, but give up if it keeps dying.
+    $Restarts = @($Restarts | Where-Object { $_ -gt (Get-Date).AddMinutes(-10) }) + (Get-Date)
+    if ($Restarts.Count -gt 3) {
+        Write-Host "llama-server exited 4 times in 10 minutes; not restarting. See $CrashLog" -ForegroundColor Red
+        break
+    }
+    Write-Host "llama-server exited with code $code; restarting in 5 s" -ForegroundColor Yellow
+    Start-Sleep 5
+}
