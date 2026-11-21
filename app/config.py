@@ -16,6 +16,7 @@ class Settings:
         self.cookies_path = self.data_dir / "secrets" / "burner_cookies.txt"
         self.web_dir = Path(_env("WEB_DIR", str(Path(__file__).resolve().parent.parent / "web")))
         self.api_token = _env("API_TOKEN", "")
+        self.auth_disabled = _env("AUTH_DISABLED", "0") == "1"
         self.fetch_delay_min = float(_env("FETCH_DELAY_MIN", 20))
         self.fetch_delay_max = float(_env("FETCH_DELAY_MAX", 40))
         self.min_free_gb = float(_env("MIN_FREE_GB", 5))
@@ -39,13 +40,29 @@ class Settings:
         self.search_models = _env("SEARCH_MODELS", "1") not in ("0", "false", "no")
         self.search_idle_unload = float(_env("SEARCH_IDLE_UNLOAD", 900))
         self.idle_sleep = float(_env("WORKER_IDLE_SLEEP", 10))
+        self.cgroup_dir = _env("CGROUP_DIR", "")
+        self.system_mem_bytes = int(_env("SYSTEM_MEM_BYTES", 0))
+        self.cors_origins = [o.strip() for o in _env(
+            "CORS_ORIGINS", "http://tauri.localhost,https://tauri.localhost,tauri://localhost").split(",") if o.strip()]
 
 
 settings = Settings()
 
 
-def in_batch_window(at=None):
-    window = settings.batch_window.strip().lower()
+def valid_window(window):
+    window = (window or "").strip().lower()
+    if window in ("always", "never", "off", ""):
+        return True
+    from datetime import time
+    try:
+        start, end = (time.fromisoformat(p.strip()) for p in window.split("-"))
+    except ValueError:
+        return False
+    return True
+
+
+def in_batch_window(at=None, window=None):
+    window = (window or settings.batch_window).strip().lower()
     if window == "always":
         return True
     if window in ("never", "off", ""):

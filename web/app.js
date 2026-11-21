@@ -101,41 +101,60 @@ function showLogin(msg = '') {
   document.getElementById('topbar').setAttribute('inert', '');
   box.innerHTML = `<form class="login" novalidate>
     <span class="brand-mark" aria-hidden="true"></span>
-    <div><h1>Saved</h1><p>Enter the API token from the server's <code>API_TOKEN</code> setting.</p></div>
-    <label class="field"><span>API token</span>
-      <input class="input" id="tok" type="password" required autocomplete="current-password" autocapitalize="off" spellcheck="false"></label>
+    <div><h1>Saved</h1><p>Sign in to your archive.</p></div>
+    <label class="field"><span>Username</span>
+      <input class="input" id="user" required autocomplete="username" autocapitalize="off" spellcheck="false"></label>
+    <label class="field"><span>Password</span>
+      <input class="input" id="pass" type="password" required autocomplete="current-password"></label>
     <div class="err" role="alert">${esc(msg)}</div>
-    <button class="btn primary">${icon('lock', 'sm')}Unlock</button></form>`;
+    <button class="btn primary">${icon('lock', 'sm')}Sign in</button></form>`;
   const form = box.querySelector('form');
-  const inp = box.querySelector('#tok');
-  inp.focus();
+  const user = box.querySelector('#user');
+  const inp = box.querySelector('#pass');
+  user.focus();
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
-    const tok = inp.value.trim();
     const err = box.querySelector('.err');
-    if (!tok) { err.textContent = 'Enter a token.'; return; }
+    if (!user.value.trim() || !inp.value) { err.textContent = 'Enter your username and password.'; return; }
     const btn = form.querySelector('button');
     btn.disabled = true;
     err.textContent = '';
     try {
-      await API.get('/status', { tokenOverride: tok });
-      API.setToken(tok);
+      const r = await API.post('/login', { username: user.value.trim(), password: inp.value }, { tokenOverride: '' });
+      API.setToken(r.token);
       box.hidden = true;
       box.innerHTML = '';
       document.getElementById('view').removeAttribute('inert');
       document.getElementById('topbar').removeAttribute('inert');
       start();
     } catch (ex) {
-      err.textContent = ex.status === 401 ? 'That token was rejected.' : ex.message;
+      err.textContent = ex.message;
       btn.disabled = false;
       inp.select();
     }
   });
 }
 
+// The desktop app embeds this UI in a frame and hands over the session token it already has.
+const DESKTOP_ORIGINS = ['http://tauri.localhost', 'https://tauri.localhost', 'tauri://localhost'];
+window.addEventListener('message', (e) => {
+  if (!DESKTOP_ORIGINS.includes(e.origin) || e.data?.type !== 'saved:token' || !e.data.token) return;
+  if (e.data.token === API.getToken()) return;
+  API.setToken(e.data.token);
+  location.reload();
+});
+if (window.parent !== window) window.parent.postMessage({ type: 'saved:ready' }, '*');
+
+document.addEventListener('keydown', (e) => {
+  if (e.key !== '/' || e.ctrlKey || e.metaKey || e.altKey) return;
+  if (e.target.closest?.('input, textarea, select, [contenteditable]') || document.getElementById('dlg')?.open) return;
+  const q = document.getElementById('q');
+  if (q && q.offsetParent !== null) { e.preventDefault(); q.focus(); q.select(); }
+});
+
 window.addEventListener('saved:auth', () => {
   API.setToken(null);
-  showLogin('Your token is missing or no longer valid.');
+  showLogin('Your session ended. Sign in again.');
 });
 
 function start() {

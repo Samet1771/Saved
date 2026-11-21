@@ -20,8 +20,14 @@ services:
       DATA_DIR: /data
       MEDIA_DIR: /media
       HF_HOME: /data/models
-      API_TOKEN: ${API_TOKEN:?set API_TOKEN in .env}
+      API_TOKEN: ${API_TOKEN:-}
+      # The cgroup of the machine/LXC running Docker, for whole-server CPU and RAM in /api/status.
+      CGROUP_DIR: /host/cgroup
     mem_limit: 3g
+    volumes:
+      - ./data:/data
+      - ${MEDIA_HOST_DIR:-./data/media}:/media
+      - /sys/fs/cgroup:/host/cgroup:ro
 
   worker:
     <<: *common

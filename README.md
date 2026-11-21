@@ -42,7 +42,8 @@ The pipeline was chosen with a benchmark on 20 real reels: 7 speech models, 6 OC
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `API_TOKEN` | (required in compose) | Bearer token for `/api/*`; `/media/*` also takes `?t=`. Empty disables auth (dev only) |
+| `API_TOKEN` | empty | Optional fixed bearer token for scripts, accepted next to sign-in sessions |
+| `AUTH_DISABLED` | `0` | `1` turns authentication off (local development only) |
 | `DATA_DIR` | `/data` | `vault.db`, `models/`, `secrets/` |
 | `MEDIA_DIR` | `$DATA_DIR/media` | Downloaded media (`<shortcode>/0.mp4`, `thumb.jpg`, keyframes) |
 | `MEDIA_HOST_DIR` | `./data/media` | compose only: host directory mounted at `/media` |
@@ -62,6 +63,8 @@ The pipeline was chosen with a benchmark on 20 real reels: 7 speech models, 6 OC
 | `TEXT_EMBED_DIM` | (from the model) | Only needed for models the code doesn't know |
 | `VISUAL_EMBED_MODEL` | `google/siglip2-base-patch16-224` | Frame and query embeddings (768-d) |
 | `SEARCH_MODELS` | `1` | `0` = keyword-only search in the api: no ML libraries are loaded, which saves about 2 GB of RAM |
+| `SYSTEM_MEM_BYTES` | (from the cgroup) | RAM total shown in the status, for LXCs whose memory limit isn't visible from inside |
+| `CORS_ORIGINS` | the desktop app's origins | Browser origins allowed to call the API |
 
 Hugging Face models download on first use into `DATA_DIR/models` (`HF_HOME`).
 
@@ -96,7 +99,7 @@ Hugging Face models download on first use into `DATA_DIR/models` (`HF_HOME`).
    # /srv/saved already holds the two mount points, so clone elsewhere and copy in:
    git clone https://github.com/Samet1771/Saved.git /tmp/saved && cp -a /tmp/saved/. /srv/saved/
    cd /srv/saved
-   cp .env.example .env    # set API_TOKEN, MEDIA_HOST_DIR=/srv/saved/media, LLM_REMOTE_URL and LLM_REMOTE_KEY
+   cp .env.example .env    # set MEDIA_HOST_DIR=/srv/saved/media, LLM_REMOTE_URL and LLM_REMOTE_KEY
    mkdir -p data/models data/secrets
    ```
 4. Start the GPU side on your PC ([tools/pc-llm](tools/pc-llm/README.md)).
@@ -104,9 +107,16 @@ Hugging Face models download on first use into `DATA_DIR/models` (`HF_HOME`).
    ```bash
    docker compose up -d --build
    ```
+   Then create your account (it asks for a username and a password):
+   ```bash
+   docker compose exec api python -m app.auth set-password
+   ```
+   Run it again to change the password. `python -m app.auth sign-out-all` revokes every session.
 6. Import your saves: in Instagram, request **Download your information** in **JSON** format. Then use the import button in the UI, or:
    ```bash
-   curl -H "Authorization: Bearer $API_TOKEN" -F file=@instagram-export.zip http://<server-ip>:8080/api/import
+   TOKEN=$(curl -s -H 'Content-Type: application/json' -d '{"username":"<you>","password":"<password>"}' \
+     http://<server-ip>:8080/api/login | python3 -c 'import json,sys;print(json.load(sys.stdin)["token"])')
+   curl -H "Authorization: Bearer $TOKEN" -F file=@instagram-export.zip http://<server-ip>:8080/api/import
    ```
    The relevant files are `your_instagram_activity/saved/saved_posts.json` and `saved_collections.json`; uploading the whole zip is fine.
 7. Optional burner account: if anonymous fetches fail (photo posts usually need a login), put a Netscape-format cookies file from a **burner** account at `data/secrets/burner_cookies.txt`.
@@ -123,7 +133,7 @@ Update yt-dlp and gallery-dl regularly, because Instagram changes often: `docker
 4. Add **Get Contents of URL**:
    - URL: `http://<server-ip>:8080/api/ingest`
    - Method: **POST**
-   - Headers: `Authorization` = `Bearer <your API_TOKEN>`
+   - Headers: `Authorization` = `Bearer <token>`. Create the token in the web UI under **Settings → Siri Shortcut → Create token**. It stays valid until you change the password.
    - Request Body: **JSON**, with key `url` (Text) set to the *URLs* variable from step 3.
 5. Add **Get Dictionary Value** `status` from *Contents of URL*, then **Show Notification**: `Saved: <Dictionary Value>`.
 6. In Instagram, tap Share → *Saved*. The response comes back immediately; the worker picks the item up within about a minute.
@@ -144,11 +154,16 @@ Run the api with demo data for UI work. This uses keyword-only search, so no ML 
 
 ```bash
 DATA_DIR=./data-demo .venv/Scripts/python scripts/seed_demo.py --reset
-DATA_DIR=./data-demo API_TOKEN=dev SEARCH_MODELS=0 .venv/Scripts/python -m uvicorn app.api:app --port 8080 --reload
-# http://localhost:8080/  token: dev
+DATA_DIR=./data-demo .venv/Scripts/python -m app.auth set-password --username dev
+DATA_DIR=./data-demo SEARCH_MODELS=0 .venv/Scripts/python -m uvicorn app.api:app --port 8080 --reload
+# http://localhost:8080/  sign in as dev
 ```
 
 `requirements-ml.txt` (torch CPU, torchvision, faster-whisper, sentence-transformers, transformers, rapidocr + onnxruntime, Pillow) is needed only by the worker and by vector search. The `app/ml/*` wrappers import them lazily.
+
+## Desktop app
+
+A Windows app in [desktop/](desktop/README.md) (Tauri 2) that shows the server's health and pipeline progress, controls the worker, starts and stops the GPU PC's llama-server, and embeds the web UI. It talks to the server only through the HTTP API. Build it with `cd desktop && npm install && npx tauri build`.
 
 ## A note on use
 

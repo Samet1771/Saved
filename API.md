@@ -87,7 +87,20 @@ ItemSummary plus:
 
 ### Auth
 
-Every `/api/*` route needs `Authorization: Bearer <API_TOKEN>`. That covers reads too, because the vault is reachable over the tailnet. `/media/*` and `/api/events/stream` take `?t=<token>` or the header, since `<video src>` and `EventSource` can't send headers. `/` and the static files are public.
+Sign in with `POST /api/login {username, password, label?}`. It returns `{token, username}`; the token is a session that lasts until sign-out or a password change. Every other `/api/*` route needs `Authorization: Bearer <token>`. That covers reads too, because the vault is reachable over the tailnet. `/media/*` and `/api/events/stream` take `?t=<token>` or the header, since `<video src>` and `EventSource` can't send headers. `/` and the static files are public.
+
+- One account, stored as a scrypt hash in the `settings` table. Create or change it with `python -m app.auth set-password`; that also signs out every session.
+- `/api/login` answers 409 when no account exists yet, 401 for a wrong username or password, and 429 after 5 failures from one address in 5 minutes.
+- Sessions are kept as SHA-256 hashes in the `sessions` table, never in plain text.
+- An optional `API_TOKEN` in `.env` is accepted as a fixed bearer token for scripts. `AUTH_DISABLED=1` turns authentication off (development only).
+
+| Method + path | Body | Returns |
+|---|---|---|
+| `POST /api/login` | `{username, password, label?}` (no auth) | `{token, username}` |
+| `POST /api/logout` | | `{ok}`; revokes the token used for the call |
+| `GET /api/account` | | `{username}` |
+| `PUT /api/account/password` | `{current_password, new_password}` (8+ chars) | `{ok}`; signs out every other session; 403 if the current password is wrong |
+| `POST /api/tokens` | `{label?}` | `{token}`: a session for the Siri Shortcut or scripts |
 
 ### Items and search
 

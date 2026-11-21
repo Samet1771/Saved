@@ -175,3 +175,55 @@ def test_static_fallback(client, env):
     assert client.get("/missing.css").status_code == 404
     assert client.get("/api/nope").status_code == 404
     assert json.loads(client.get("/api/nope").text) == {"detail": "not found"}
+
+
+def test_worker_controls_and_system_stats(client, conn):
+    s = client.get("/api/status").json()
+    assert s["controls"] == {"worker_paused": False, "fetch_paused": False, "batch_window": None,
+                             "batch_window_default": "always", "batch_window_effective": "always"}
+    assert {"cpu_percent", "mem_used_bytes", "load", "uptime_s", "api_rss_mb", "worker_rss_mb"} <= set(s["system"])
+    r = client.put("/api/worker", json={"paused": True, "fetch_paused": True, "batch_window": "02:00-06:00"})
+    c = r.json()["controls"]
+    assert c["worker_paused"] and c["fetch_paused"] and c["batch_window_effective"] == "02:00-06:00"
+    assert client.put("/api/worker", json={"batch_window": "soon"}).status_code == 422
+    c = client.put("/api/worker", json={"paused": False, "reset_batch_window": True}).json()["controls"]
+    assert not c["worker_paused"] and c["fetch_paused"] and c["batch_window"] is None
+
+
+def test_retry_failed_bulk(client, conn):
+    a = add_item(conn, "F1", status="failed", failed_stage="enrich")
+    b = add_item(conn, "F2", status="failed", failed_stage="fetch")
+    c = add_item(conn, "F3", status="private")
+    assert client.post("/api/items/retry-failed").json() == {"queued": 2}
+    st = {r[0]: r[1] for r in conn.execute("SELECT id, status FROM items")}
+    assert (st[a], st[b], st[c]) == ("extracted", "queued", "private")
+    assert client.post("/api/items/retry-failed", json={"include_skipped": True}).json() == {"queued": 1}
+
+
+def test_cors_allows_desktop_app(client):
+    r = client.options("/api/status", headers={"Origin": "http://tauri.localhost", "Access-Control-Request-Method": "GET",
+                                               "Access-Control-Request-Headers": "authorization"})
+    assert r.headers["access-control-allow-origin"] == "http://tauri.localhost"
+    r = client.options("/api/status", headers={"Origin": "http://evil.example", "Access-Control-Request-Method": "GET"})
+    assert "access-control-allow-origin" not in r.headers
+
+
+def test_system_stats_from_cgroup(env, tmp_path, monkeypatch):
+    from app import api
+    cg = tmp_path / "cg"
+    cg.mkdir()
+    (cg / "cpu.stat").write_text("usage_usec 1000000\nuser_usec 900000\n")
+    (cg / "memory.current").write_text("3000000000\n")
+    (cg / "memory.stat").write_text("anon 900000000\nfile 2000000000\n")
+    (cg / "memory.max").write_text("max\n")
+    (cg / "cpuset.cpus.effective").write_text("0-3\n")
+    monkeypatch.setattr(env, "cgroup_dir", str(cg))
+    monkeypatch.setattr(env, "system_mem_bytes", 4 * 1024 ** 3)
+    monkeypatch.setattr(api, "_cpu_prev", {"total": None, "idle": None, "usec": None, "at": None})
+    clock = iter([100.0, 102.0])
+    monkeypatch.setattr(api.time, "monotonic", lambda: next(clock))
+    s = api.system_stats()
+    assert s["cpus"] == 4 and s["cpu_percent"] is None
+    assert s["mem_used_bytes"] == 1000000000 and s["mem_total_bytes"] == 4 * 1024 ** 3
+    (cg / "cpu.stat").write_text("usage_usec 5000000\n")
+    assert api.system_stats()["cpu_percent"] == 50.0

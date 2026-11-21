@@ -3,7 +3,7 @@ import { libHash } from './router.js';
 import { icon, esc, fmtBytes, fmtAgo, statusPill, STATUSES, RETRYABLE, toast, toastErr, copyText, confirmDialog } from './util.js';
 import { activityMarkup, initActivity, renderActivity, startActivity, stopActivity, updateBusy } from './activity.js';
 
-let el, timer = null, cats = null, showToken = false, models = null, dlTimer = null;
+let el, timer = null, cats = null, models = null, dlTimer = null;
 
 const BIG_MODEL = 3.2e9;
 const gb = (n) => `${((n || 0) / 1e9).toFixed(2)} GB`;
@@ -52,18 +52,21 @@ export function initSettings(root) {
           <li>In Shortcuts, create a shortcut and turn on <b>Show in Share Sheet</b> (accepts URLs).</li>
           <li>Add <b>Get Contents of URL</b> with this URL, method <b>POST</b>:
             <div class="row"><pre class="code" id="siri-url"></pre><button type="button" class="btn sm" data-copy="siri-url">${icon('copy', 'sm')}Copy</button></div></li>
-          <li>Add a header <b>Authorization</b> with the value:
-            <div class="row"><pre class="code" id="siri-auth"></pre><button type="button" class="btn sm" data-act="reveal"></button><button type="button" class="btn sm" data-copy="siri-auth-real">${icon('copy', 'sm')}Copy</button></div></li>
+          <li>Add a header <b>Authorization</b> with a Shortcut token. It is shown once and stays valid until you change the password:
+            <div class="row"><pre class="code" id="siri-auth">Bearer …</pre><button type="button" class="btn sm" data-act="mktoken">${icon('lock', 'sm')}Create token</button><button type="button" class="btn sm" data-copy="siri-auth" hidden>${icon('copy', 'sm')}Copy</button></div></li>
           <li>Request body <b>JSON</b> with one text field <code>url</code> set to <b>Shortcut Input</b>:
             <div class="row"><pre class="code">{"url": "&lt;Shortcut Input&gt;"}</pre></div></li>
           <li>Optional: add <b>Show Notification</b> so you see “queued”. The phone must reach the server (home Wi-Fi or Tailscale).</li>
         </ol>
       </section>
-      <section class="panel wide" aria-labelledby="h-token"><h2 id="h-token">API token</h2>
-        <p>Stored only in this browser. Change it if the server's <code>API_TOKEN</code> changed.</p>
-        <form class="row" data-form="token"><label class="sr-only" for="new-token">New token</label>
-          <input id="new-token" class="input" type="password" required placeholder="New token" autocomplete="off">
-          <button class="btn">Save token</button>
+      <section class="panel wide" aria-labelledby="h-account"><h2 id="h-account">Account</h2>
+        <p>Signed in as <b class="acct-user">…</b>. Changing the password signs out every other device and Shortcut token.</p>
+        <form class="row" data-form="password">
+          <label class="sr-only" for="pw-cur">Current password</label>
+          <input id="pw-cur" class="input" type="password" required placeholder="Current password" autocomplete="current-password">
+          <label class="sr-only" for="pw-new">New password</label>
+          <input id="pw-new" class="input" type="password" required minlength="8" placeholder="New password" autocomplete="new-password">
+          <button class="btn">Change password</button>
           <button type="button" class="btn ghost danger" data-act="signout">${icon('logout', 'sm')}Sign out</button></form>
       </section>
     </div></div>`;
@@ -78,9 +81,7 @@ export function initSettings(root) {
 
 function renderSiri() {
   el.querySelector('#siri-url').textContent = `${location.origin}/api/ingest`;
-  const tok = API.getToken() || '';
-  el.querySelector('#siri-auth').textContent = `Bearer ${showToken ? tok : '•'.repeat(Math.min(24, Math.max(8, tok.length)))}`;
-  el.querySelector('[data-act="reveal"]').textContent = showToken ? 'Hide' : 'Show';
+  API.get('/account').then((a) => { el.querySelector('.acct-user').textContent = a.username || '(no account)'; }).catch(() => {});
 }
 
 async function loadStatus() {
@@ -237,7 +238,7 @@ async function onClick(e) {
   const t = e.target.closest('button, a');
   if (!t) return;
   if (t.dataset.copy) {
-    return copyText(t.dataset.copy === 'siri-auth-real' ? `Bearer ${API.getToken() || ''}` : el.querySelector(`#${t.dataset.copy}`).textContent);
+    return copyText(el.querySelector(`#${t.dataset.copy}`).textContent);
   }
   if (t.dataset.retry) {
     try { await API.post(`/items/${t.dataset.retry}/retry`); toast('Queued for retry'); loadStatus(); } catch (err) { toastErr(err); }
@@ -251,9 +252,17 @@ async function onClick(e) {
     case 'refresh': loadStatus(); break;
     case 'addcat': addCat(el.querySelector('#cat-new').value); break;
     case 'retag': retagItems(); break;
-    case 'reveal': showToken = !showToken; renderSiri(); break;
+    case 'mktoken':
+      try {
+        const r = await API.post('/tokens', { label: 'Siri Shortcut' });
+        el.querySelector('#siri-auth').textContent = `Bearer ${r.token}`;
+        el.querySelector('[data-copy="siri-auth"]').hidden = false;
+        toast('Token created. Copy it now; it is not shown again.');
+      } catch (err) { toastErr(err); }
+      break;
     case 'signout':
-      if (await confirmDialog('Sign out?', 'The token is removed from this browser.', { ok: 'Sign out' })) {
+      if (await confirmDialog('Sign out?', 'This browser is signed out.', { ok: 'Sign out' })) {
+        await API.post('/logout').catch(() => {});
         API.setToken(null);
         window.dispatchEvent(new CustomEvent('saved:auth'));
       }
@@ -287,14 +296,10 @@ async function onSubmit(e) {
       API.invalidateCollections();
       f.reset();
       loadStatus();
-    } else if (f.dataset.form === 'token') {
-      const inp = f.querySelector('input');
-      const tok = inp.value.trim();
-      await API.get('/status', { tokenOverride: tok });
-      API.setToken(tok);
-      inp.value = '';
-      toast('Token saved');
-      renderSiri();
+    } else if (f.dataset.form === 'password') {
+      await API.put('/account/password', { current_password: f.querySelector('#pw-cur').value, new_password: f.querySelector('#pw-new').value });
+      f.reset();
+      toast('Password changed. Other devices were signed out.');
     } else if (f.dataset.form === 'download') {
       el.querySelector('#s-models .dl').innerHTML = '';
       models = await API.post('/models/download', { repo: f.querySelector('#dl-repo').value.trim(), file: f.querySelector('#dl-file').value.trim() });
@@ -308,7 +313,7 @@ async function onSubmit(e) {
       return;
     }
     if (f.dataset.form === 'import') el.querySelector('.result').textContent = `Import failed: ${err.message}`;
-    toastErr(err.status === 401 && f.dataset.form === 'token' ? new Error('That token was rejected') : err);
+    toastErr(err);
   } finally { btn.disabled = false; }
 }
 

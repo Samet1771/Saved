@@ -70,6 +70,7 @@ class Worker:
         self.stop = False
         self.next_fetch = 0.0
         self.paused = False
+        self.held = {"worker_paused": False, "fetch_paused": False, "batch_window": None}
         self.backoff_level = 0
         self.backoff_until = None
         self.cookies_mtime = None
@@ -223,7 +224,7 @@ class Worker:
         db.set_llm_status(self.conn, healthy, st["checked_at"], st["model"], backend)
 
     def ingest_waiting(self):
-        excluded = ("queued",) if self.paused else ()
+        excluded = ("queued",) if self.paused or self.held["fetch_paused"] else ()
         if not llm.can_enrich():
             excluded += ("extracted",)
         statuses = [s for s in PENDING if s not in excluded]
@@ -237,7 +238,7 @@ class Worker:
         for name, from_status, module in self.stages:
             if self.stop:
                 break
-            if name == "fetch" and self.paused:
+            if name == "fetch" and (self.paused or self.held["fetch_paused"]):
                 continue
             ids = [r[0] for r in self.conn.execute(
                 "SELECT id FROM items WHERE source='ingest' AND status=? ORDER BY id", (from_status,))]
@@ -256,7 +257,7 @@ class Worker:
         backlog = self.conn.execute("SELECT COUNT(*) FROM items WHERE status='extracted' AND source='export'"
                                     ).fetchone()[0]
         t0 = time.perf_counter()
-        while not self.stop and not self.ingest_waiting() and llm.remote_healthy():
+        while not self.stop and not self.ingest_waiting() and llm.remote_healthy() and not self.on_hold():
             row = next((r for r in self.conn.execute("SELECT id FROM items WHERE status='extracted'"
                                                      " AND source='export' ORDER BY id") if r[0] not in tried), None)
             if not row:
@@ -277,7 +278,7 @@ class Worker:
             return False
         self.set_paused(not fetch.disk_free_ok())
         db.set_worker(self.conn, "idle", paused=self.paused)
-        if self.paused:
+        if self.paused or self.held["fetch_paused"]:
             return False
         row = self.conn.execute("SELECT id FROM items WHERE status='queued' AND source='export'"
                                 " ORDER BY rate_limited, id LIMIT 1").fetchone()
@@ -304,7 +305,7 @@ class Worker:
             t0, done, complete = time.perf_counter(), 0, False
             try:
                 for item_id in ids:
-                    if self.stop or self.ingest_waiting() or not in_batch_window():
+                    if self.stop or self.ingest_waiting() or not self.window_open() or self.on_hold():
                         return True
                     self.maybe_fetch()
                     if self._row(item_id)["status"] == from_status:
@@ -320,10 +321,26 @@ class Worker:
                 self.unload(module)
         return worked
 
+    def window_open(self):
+        w = self.held["batch_window"]
+        return in_batch_window(window=w) if w else in_batch_window()
+
+    def on_hold(self):
+        held = db.controls(self.conn)
+        if held != self.held:
+            changes = [f"{k.replace('_', ' ')} {'on' if v else 'off'}" if isinstance(v, bool)
+                       else f"batch window {v or 'default'}" for k, v in held.items() if v != self.held[k]]
+            self.event("worker", "controls changed: " + ", ".join(changes))
+            self.held = held
+        return held["worker_paused"]
+
     def tick(self):
+        if self.on_hold():
+            db.set_worker(self.conn, "paused", paused=self.paused)
+            return False
         self.set_paused(not fetch.disk_free_ok())
         self.check_cookies()
-        window = in_batch_window()
+        window = self.window_open()
         db.set_worker(self.conn, "idle", in_window=window, paused=self.paused)
         self.check_remote()
         if self.process_ingest():

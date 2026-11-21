@@ -190,3 +190,20 @@ def test_classify():
     assert fetch.classify("ERROR: [Instagram] X: This account is private") == "private"
     assert fetch.classify("HttpError: '404 Not Found' for 'https://www.instagram.com/p/X/'") == "gone"
     assert fetch.classify("Connection reset by peer") is None
+
+
+def test_pause_controls_hold_the_worker(setup, conn, monkeypatch):
+    monkeypatch.setattr(worker, "in_batch_window", lambda: False)
+    db.set_setting(conn, "worker_paused", "1")
+    i = add_item(conn, "P1", status="queued", source="ingest")
+    assert setup.w.tick() is False and setup.log == []
+    assert conn.execute("SELECT stage FROM worker_status").fetchone()[0] == "paused"
+    db.set_setting(conn, "worker_paused", "0")
+    db.set_setting(conn, "fetch_paused", "1")
+    setup.w.tick()
+    assert setup.log == [] and status(conn, i)["status"] == "queued"
+    db.set_setting(conn, "fetch_paused", "0")
+    setup.w.tick()
+    assert status(conn, i)["status"] == "indexed"
+    msgs = [r[0] for r in conn.execute("SELECT message FROM events")]
+    assert any("controls changed: worker paused on" in m for m in msgs)

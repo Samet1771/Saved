@@ -15,11 +15,13 @@ from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, FastAPI, File, Header, HTTPException, Query, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
+from . import auth as accounts
 from . import db, importer
-from .config import in_batch_window, settings
+from .config import in_batch_window, settings, valid_window
 from .ml import llm
 from .search import search, unload_if_idle
 
@@ -36,9 +38,11 @@ SAFE_NAME = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*$")
 @asynccontextmanager
 async def lifespan(_app):
     conn = db.open_db()
+    if settings.auth_disabled:
+        log.warning("AUTH_DISABLED is set: authentication is OFF")
+    elif not accounts.has_account(conn):
+        log.warning("No account yet. Create one: docker compose exec api python -m app.auth set-password")
     conn.close()
-    if not settings.api_token:
-        log.warning("API_TOKEN is empty: authentication is DISABLED")
     task = asyncio.create_task(_idle_unloader())
     yield
     task.cancel()
@@ -51,6 +55,9 @@ async def _idle_unloader():
 
 
 app = FastAPI(title="Saved", lifespan=lifespan)
+if settings.cors_origins:
+    app.add_middleware(CORSMiddleware, allow_origins=settings.cors_origins, allow_methods=["*"],
+                       allow_headers=["Authorization", "Content-Type", "Range"], expose_headers=["Content-Range"])
 
 
 @app.exception_handler(RequestValidationError)
@@ -60,7 +67,17 @@ async def validation_error(_request, exc):
 
 
 def token_ok(token):
-    return not settings.api_token or (bool(token) and secrets.compare_digest(token.encode(), settings.api_token.encode()))
+    if settings.auth_disabled:
+        return True
+    if not token:
+        return False
+    if settings.api_token and secrets.compare_digest(token.encode(), settings.api_token.encode()):
+        return True
+    conn = db.connect()
+    try:
+        return accounts.session_ok(conn, token)
+    finally:
+        conn.close()
 
 
 def bearer(authorization):
@@ -83,6 +100,76 @@ def get_conn():
 
 
 api = APIRouter(prefix="/api", dependencies=[Depends(auth)])
+
+LOGIN_WINDOW_S = 300
+LOGIN_MAX_FAILS = 5
+_login_fails = {}
+_login_lock = threading.Lock()
+
+
+def _recent_fails(ip):
+    cutoff = time.monotonic() - LOGIN_WINDOW_S
+    with _login_lock:
+        fails = [t for t in _login_fails.get(ip, []) if t > cutoff]
+        _login_fails[ip] = fails
+        return len(fails)
+
+
+class LoginBody(BaseModel):
+    username: str
+    password: str
+    label: Optional[str] = None
+
+
+@app.post("/api/login")
+def login(body: LoginBody, request: Request, conn=Depends(get_conn)):
+    ip = request.client.host if request.client else "?"
+    if _recent_fails(ip) >= LOGIN_MAX_FAILS:
+        raise HTTPException(429, "Too many failed sign-ins. Try again in a few minutes.")
+    if not accounts.has_account(conn):
+        raise HTTPException(409, "No account yet. On the server run: docker compose exec api python -m app.auth set-password")
+    if not accounts.check_login(conn, body.username.strip(), body.password):
+        with _login_lock:
+            _login_fails.setdefault(ip, []).append(time.monotonic())
+        raise HTTPException(401, "Wrong username or password")
+    label = body.label or (request.headers.get("user-agent") or "")[:80]
+    return {"token": accounts.create_session(conn, label), "username": accounts.username(conn)}
+
+
+@api.post("/logout")
+def logout(authorization: Optional[str] = Header(None), conn=Depends(get_conn)):
+    accounts.revoke(conn, bearer(authorization) or "")
+    return {"ok": True}
+
+
+@api.get("/account")
+def account(conn=Depends(get_conn)):
+    return {"username": accounts.username(conn)}
+
+
+class PasswordBody(BaseModel):
+    current_password: str
+    new_password: str
+
+
+@api.put("/account/password")
+def change_password(body: PasswordBody, authorization: Optional[str] = Header(None), conn=Depends(get_conn)):
+    if not accounts.has_account(conn) or not accounts.verify_password(body.current_password, db.get_setting(conn, "auth_hash")):
+        raise HTTPException(403, "The current password is wrong")
+    if len(body.new_password) < accounts.MIN_PASSWORD:
+        raise HTTPException(422, f"Use at least {accounts.MIN_PASSWORD} characters")
+    accounts.set_account(conn, accounts.username(conn), body.new_password)
+    accounts.revoke_others(conn, bearer(authorization))
+    return {"ok": True}
+
+
+class TokenBody(BaseModel):
+    label: str = "Siri Shortcut"
+
+
+@api.post("/tokens")
+def create_token(body: TokenBody, conn=Depends(get_conn)):
+    return {"token": accounts.create_session(conn, body.label)}
 
 
 def media_url(shortcode, name):
@@ -476,24 +563,96 @@ def eta_seconds(prog):
     return round(max(processing, fetching))
 
 
+_cpu_prev = {"total": None, "idle": None, "usec": None, "at": None}
+
+
+def _read(path):
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def _kv(text):
+    return {k: int(v) for k, v in (line.split()[:2] for line in (text or "").splitlines() if len(line.split()) >= 2)
+            if v.isdigit()}
+
+
+def _cgroup_stats(out, cg):
+    """CPU and RAM of the whole cgroup mounted at cg (the LXC running Docker), not just this container."""
+    usec = _kv(_read(f"{cg}/cpu.stat")).get("usage_usec")
+    cur = _read(f"{cg}/memory.current")
+    if usec is None or cur is None:
+        return False
+    cpus = _read(f"{cg}/cpuset.cpus.effective")
+    if cpus and cpus.strip():
+        n = 0
+        for part in cpus.strip().split(","):
+            lo, _, hi = part.partition("-")
+            n += int(hi or lo) - int(lo) + 1
+        out["cpus"] = n
+    now = time.monotonic()
+    if _cpu_prev["usec"] is not None and now > _cpu_prev["at"]:
+        busy = (usec - _cpu_prev["usec"]) / ((now - _cpu_prev["at"]) * 1e6 * (out["cpus"] or 1))
+        out["cpu_percent"] = round(max(0.0, min(1.0, busy)) * 100, 1)
+    _cpu_prev.update(usec=usec, at=now)
+    stat = _kv(_read(f"{cg}/memory.stat"))
+    out["mem_used_bytes"] = int(cur) - stat.get("file", 0)
+    limit = (_read(f"{cg}/memory.max") or "max").strip()
+    out["mem_total_bytes"] = settings.system_mem_bytes or (int(limit) if limit.isdigit() else None)
+    return True
+
+
+def system_stats():
+    """CPU/RAM of the server running Docker (an LXC's cgroup when CGROUP_DIR is mounted), plus host load and uptime."""
+    out = {"cpu_percent": None, "cpus": os.cpu_count(), "load": None, "mem_total_bytes": None,
+           "mem_used_bytes": None, "uptime_s": None, "api_rss_mb": db.rss_mb()}
+    if not (settings.cgroup_dir and _cgroup_stats(out, settings.cgroup_dir)):
+        stat = _read("/proc/stat")
+        if stat:
+            vals = [int(x) for x in stat.splitlines()[0].split()[1:]]
+            total, idle = sum(vals[:8]), vals[3] + (vals[4] if len(vals) > 4 else 0)
+            if _cpu_prev["total"] is not None and total > _cpu_prev["total"]:
+                busy = 1 - (idle - _cpu_prev["idle"]) / (total - _cpu_prev["total"])
+                out["cpu_percent"] = round(max(0.0, min(1.0, busy)) * 100, 1)
+            _cpu_prev.update(total=total, idle=idle)
+        kb = _kv((_read("/proc/meminfo") or "").replace(":", ""))
+        if "MemTotal" in kb and "MemAvailable" in kb:
+            out["mem_total_bytes"] = settings.system_mem_bytes or kb["MemTotal"] * 1024
+            out["mem_used_bytes"] = (kb["MemTotal"] - kb["MemAvailable"]) * 1024
+    load = _read("/proc/loadavg")
+    if load:
+        out["load"] = [float(x) for x in load.split()[:3]]
+    up = _read("/proc/uptime")
+    if up:
+        out["uptime_s"] = int(float(up.split()[0]))
+    return out
+
+
 def status_payload(conn):
     settings.media_dir.mkdir(parents=True, exist_ok=True)
     du = shutil.disk_usage(settings.media_dir)
     w = conn.execute("SELECT * FROM worker_status WHERE id=1").fetchone()
     sc = conn.execute("SELECT shortcode FROM items WHERE id=?", (w["item_id"],)).fetchone() if w["item_id"] else None
     prog = progress(conn)
+    held = db.controls(conn)
     return {
         "counts": {r[0]: r[1] for r in conn.execute("SELECT status, COUNT(*) FROM items GROUP BY 1")},
         "disk": {"free_bytes": du.free, "total_bytes": du.total, "media_bytes": media_bytes(),
                  "paused": du.free < settings.min_free_gb * 1024 ** 3},
         "worker": {"stage": w["stage"], "item_id": w["item_id"], "shortcode": sc[0] if sc else None,
-                   "since": w["since"], "heartbeat": w["heartbeat"], "in_batch_window": in_batch_window(),
+                   "since": w["since"], "heartbeat": w["heartbeat"],
+                   "in_batch_window": in_batch_window(window=held["batch_window"]) if held["batch_window"] else in_batch_window(),
                    "llm_model": llm.active_file(conn), "fetch_backoff_until": w["fetch_backoff_until"],
                    "llm_backend": w["llm_backend"],
                    "llm_remote": {"url": settings.llm_remote_url or None, "healthy": bool(w["llm_remote_healthy"]),
                                   "checked_at": w["llm_remote_checked_at"], "model": w["llm_remote_model"]}},
         "progress": prog,
         "eta_seconds": eta_seconds(prog),
+        "controls": {**held, "batch_window_default": settings.batch_window,
+                     "batch_window_effective": held["batch_window"] or settings.batch_window},
+        "system": {**system_stats(), "worker_rss_mb": w["rss_mb"]},
         "last_errors": [dict(r) for r in conn.execute(
             "SELECT id, shortcode, status, error FROM items WHERE status IN ('failed', 'private', 'gone', 'needs_login')"
             " ORDER BY updated_at DESC, id DESC LIMIT 20")],
@@ -503,6 +662,49 @@ def status_payload(conn):
 @api.get("/status")
 def status(conn=Depends(get_conn)):
     return status_payload(conn)
+
+
+class WorkerControls(BaseModel):
+    paused: Optional[bool] = None
+    fetch_paused: Optional[bool] = None
+    batch_window: Optional[str] = None
+    reset_batch_window: bool = False
+
+
+@api.put("/worker")
+def set_worker_controls(body: WorkerControls, conn=Depends(get_conn)):
+    if body.batch_window is not None and not valid_window(body.batch_window):
+        raise HTTPException(422, "batch_window must be HH:MM-HH:MM, always or never")
+    if body.paused is not None:
+        db.set_setting(conn, "worker_paused", "1" if body.paused else "0")
+    if body.fetch_paused is not None:
+        db.set_setting(conn, "fetch_paused", "1" if body.fetch_paused else "0")
+    if body.reset_batch_window:
+        conn.execute("DELETE FROM settings WHERE key='batch_window'")
+        conn.commit()
+    elif body.batch_window is not None:
+        db.set_setting(conn, "batch_window", body.batch_window.strip().lower())
+    return status_payload(conn)
+
+
+class RetryFailedBody(BaseModel):
+    include_skipped: bool = False
+
+
+@api.post("/items/retry-failed")
+def retry_failed(body: RetryFailedBody = RetryFailedBody(), conn=Depends(get_conn)):
+    n = 0
+    for stage, prev in PREV_STATUS.items():
+        n += conn.execute("UPDATE items SET status=?, error=NULL, failed_stage=NULL, attempts=0, updated_at=?"
+                          " WHERE status='failed' AND failed_stage=?", (prev, db.now(), stage)).rowcount
+    n += conn.execute("UPDATE items SET status='queued', error=NULL, failed_stage=NULL, attempts=0, updated_at=?"
+                      " WHERE status='failed' AND (failed_stage IS NULL OR failed_stage NOT IN (?, ?, ?, ?))",
+                      (db.now(), *PREV_STATUS)).rowcount
+    if body.include_skipped:
+        n += conn.execute("UPDATE items SET status='queued', error=NULL, failed_stage=NULL, attempts=0, updated_at=?"
+                          " WHERE status IN ('private', 'gone', 'needs_login')", (db.now(),)).rowcount
+    conn.commit()
+    return {"queued": n}
 
 
 def events_after(conn, after_id, limit):

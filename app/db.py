@@ -153,6 +153,12 @@ MIGRATIONS = [
     ALTER TABLE items ADD COLUMN ocr_lines TEXT;
     ALTER TABLE items ADD COLUMN details TEXT;
     """,
+    """
+    ALTER TABLE worker_status ADD COLUMN rss_mb INTEGER;
+    """,
+    """
+    CREATE TABLE sessions (token_hash TEXT PRIMARY KEY, label TEXT, created_at TEXT NOT NULL);
+    """,
 ]
 
 EVENTS_KEEP = 2000
@@ -261,10 +267,32 @@ def update_item(conn, item_id, **fields):
     conn.commit()
 
 
+def rss_mb():
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) // 1024
+    except OSError:
+        pass
+    return None
+
+
+CONTROL_KEYS = ("worker_paused", "fetch_paused", "batch_window")
+
+
+def controls(conn):
+    """User overrides from the desktop app/API; batch_window None means the .env default."""
+    vals = dict(conn.execute(f"SELECT key, value FROM settings WHERE key IN ({','.join('?' * len(CONTROL_KEYS))})",
+                             CONTROL_KEYS).fetchall())
+    return {"worker_paused": vals.get("worker_paused") == "1", "fetch_paused": vals.get("fetch_paused") == "1",
+            "batch_window": vals.get("batch_window") or None}
+
+
 def set_worker(conn, stage, item_id=None, in_window=None, paused=None):
     row = conn.execute("SELECT stage, item_id FROM worker_status WHERE id=1").fetchone()
     since = now() if (row["stage"], row["item_id"]) != (stage, item_id) else None
-    sets, args = ["stage=?", "item_id=?", "heartbeat=?"], [stage, item_id, now()]
+    sets, args = ["stage=?", "item_id=?", "heartbeat=?", "rss_mb=?"], [stage, item_id, now(), rss_mb()]
     if since:
         sets.append("since=?"); args.append(since)
     if in_window is not None:
