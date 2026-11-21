@@ -1,11 +1,19 @@
 param(
     [string]$Dir = "$PSScriptRoot",
-    [int]$Port = 8099
+    [int]$Port = 8099,
+    [int]$Parallel = 1,
+    [int]$CtxPerSlot = 0,
+    [string]$KvType = ''
 )
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
+# One slot keeps the original 64k f16 cache. With more slots the cache is shared out of the same VRAM budget:
+# 36k tokens per slot fit 120 frames (~200 tokens each) plus text, and q8_0 halves the cache.
+if ($CtxPerSlot -le 0) { $CtxPerSlot = if ($Parallel -gt 1) { 36864 } else { 65536 } }
+if (-not $KvType) { $KvType = if ($Parallel -gt 1) { 'q8_0' } else { 'f16' } }
+$KvArgs = if ($KvType -eq 'f16') { @() } else { '--cache-type-k', $KvType, '--cache-type-v', $KvType }
 $Build = 'b12558'
 $LlamaDir = Join-Path $Dir 'llama-cuda'
 $ModelsDir = Join-Path $Dir 'models'
@@ -64,9 +72,9 @@ $ErrorActionPreference = 'Continue'
 $CrashLog = Join-Path $PSScriptRoot 'crashes.log'
 $Restarts = @()
 while ($true) {
-    Write-Host "Serving $($Paths[0]) on port $Port (Ctrl+C to stop)"
+    Write-Host "Serving $($Paths[0]) on port $Port, $Parallel slot(s) of $CtxPerSlot tokens (Ctrl+C to stop)"
     & $Server -m $Paths[0] --mmproj $Paths[1] `
-        -ngl 99 -c 65536 -np 1 --host 0.0.0.0 --port $Port --api-key $Key --no-webui --reasoning off
+        -ngl 99 -c ($CtxPerSlot * $Parallel) -np $Parallel --host 0.0.0.0 --port $Port --api-key $Key --no-webui --reasoning off @KvArgs
     $code = $LASTEXITCODE
     Add-Content -Path $CrashLog -Value "$(Get-Date -Format s) llama-server exited with code $code"
     # Restart after a crash so tagging keeps going, but give up if it keeps dying.

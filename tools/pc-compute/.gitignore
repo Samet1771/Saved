@@ -1,0 +1,6 @@
+.venv/
+agent.local.json
+cache/
+logs/
+*.log
+__pycache__/
