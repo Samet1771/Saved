@@ -1,9 +1,10 @@
+mod compute;
 mod config;
 mod gpu;
 mod llm;
 
 use config::Config;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
@@ -15,6 +16,9 @@ pub struct AppState {
     pub config: Mutex<Config>,
     pub llm_started: AtomicBool,
     pub llm_user_stopped: AtomicBool,
+    pub compute_started: AtomicBool,
+    pub compute_user_stopped: AtomicBool,
+    pub hybrid: AtomicBool,
 }
 
 struct TrayParts {
@@ -36,9 +40,16 @@ fn toast(app: &AppHandle, title: &str, body: &str) {
 }
 
 #[tauri::command]
-fn tray_update(parts: State<TrayParts>, tooltip: String, gpu_running: bool, worker_paused: bool) {
+fn tray_update(state: State<AppState>, parts: State<TrayParts>, tooltip: String, gpu_running: bool, worker_paused: bool, hybrid: bool) {
+    state.hybrid.store(hybrid, Ordering::Relaxed);
     let _ = parts.tray.set_tooltip(Some(tooltip));
-    let _ = parts.gpu.set_text(if gpu_running { "Stop GPU server" } else { "Start GPU server" });
+    let label = match (hybrid, gpu_running) {
+        (true, true) => "Stop PC compute",
+        (true, false) => "Start PC compute",
+        (false, true) => "Stop GPU server",
+        (false, false) => "Start GPU server",
+    };
+    let _ = parts.gpu.set_text(label);
     let _ = parts.worker.set_text(if worker_paused { "Resume worker" } else { "Pause worker" });
 }
 
@@ -57,6 +68,10 @@ fn open_external(app: AppHandle, state: State<AppState>, url: String) -> Result<
 }
 
 fn toggle_gpu(app: &AppHandle) {
+    if app.state::<AppState>().hybrid.load(Ordering::Relaxed) {
+        let _ = app.emit_to("main", "tray-action", "toggle-compute");
+        return;
+    }
     let app = app.clone();
     std::thread::spawn(move || {
         let state = app.state::<AppState>();
@@ -119,6 +134,9 @@ pub fn run() {
                 config: Mutex::new(cfg),
                 llm_started: AtomicBool::new(false),
                 llm_user_stopped: AtomicBool::new(false),
+                compute_started: AtomicBool::new(false),
+                compute_user_stopped: AtomicBool::new(false),
+                hybrid: AtomicBool::new(false),
             });
             app.manage(build_tray(handle)?);
             for window_config in &app.config().app.windows {
@@ -151,6 +169,12 @@ pub fn run() {
             config::config_set,
             config::token_get,
             config::token_set,
+            config::compute_token_set,
+            config::compute_token_clear,
+            compute::compute_status,
+            compute::compute_start,
+            compute::compute_stop,
+            compute::compute_log_tail,
             gpu::gpu_stats,
             llm::llm_status,
             llm::llm_start,
@@ -160,6 +184,11 @@ pub fn run() {
             notify,
             open_external,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Saved");
+        .build(tauri::generate_context!())
+        .expect("error while building Saved")
+        .run(|app, event| {
+            if let tauri::RunEvent::Exit = event {
+                compute::stop_if_started(&app.state::<AppState>());
+            }
+        });
 }

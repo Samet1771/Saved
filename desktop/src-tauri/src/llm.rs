@@ -15,7 +15,7 @@ use crate::AppState;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const DETACHED_PROCESS: u32 = 0x0000_0008;
 const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-const SERVER_EXE: &str = "llama-server.exe";
+pub(crate) const SERVER_EXE: &str = "llama-server.exe";
 const SCRIPT: &str = "start-llm.ps1";
 
 #[derive(Serialize, Debug, Default)]
@@ -62,7 +62,7 @@ pub fn redact(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     loop {
-        let hit = ["LLM_REMOTE_KEY=", "--api-key "]
+        let hit = ["LLM_REMOTE_KEY=", "--api-key ", "SAVED_TOKEN=", "Bearer ", "bearer "]
             .iter()
             .filter_map(|m| rest.find(m).map(|i| (i, m.len())))
             .min();
@@ -77,7 +77,7 @@ pub fn redact(text: &str) -> String {
     out
 }
 
-fn health_ok(port: u16) -> bool {
+pub(crate) fn health_ok(port: u16) -> bool {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let Ok(mut s) = TcpStream::connect_timeout(&addr, Duration::from_millis(800)) else {
         return false;
@@ -93,7 +93,7 @@ fn health_ok(port: u16) -> bool {
     buf[..n].starts_with(b"HTTP/1.1 200") || buf[..n].starts_with(b"HTTP/1.0 200")
 }
 
-fn listener_pid(port: u16) -> Option<u32> {
+pub(crate) fn listener_pid(port: u16) -> Option<u32> {
     let out = Command::new("netstat")
         .args(["-ano", "-p", "TCP"])
         .creation_flags(CREATE_NO_WINDOW)
@@ -102,13 +102,13 @@ fn listener_pid(port: u16) -> Option<u32> {
     parse_netstat_listener(&String::from_utf8_lossy(&out.stdout), port)
 }
 
-fn inspect(sys: &mut System, pid: u32) -> Option<&Process> {
+pub(crate) fn inspect(sys: &mut System, pid: u32) -> Option<&Process> {
     let pid = Pid::from_u32(pid);
     sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[pid]), true, ProcessRefreshKind::everything());
     sys.process(pid)
 }
 
-fn is_named(p: &Process, name: &str) -> bool {
+pub(crate) fn is_named(p: &Process, name: &str) -> bool {
     p.name().to_string_lossy().eq_ignore_ascii_case(name)
 }
 
@@ -159,6 +159,9 @@ pub fn start(app: &AppHandle, state: &AppState) -> Result<(), String> {
     if !script.is_file() {
         return Err(format!("{SCRIPT} not found in {dir}"));
     }
+    if crate::compute::running() {
+        return Err("PC compute is running and owns the GPU server. Stop it first.".into());
+    }
     if status_for(port, state).running {
         return Err(format!("llama-server is already running on port {port}"));
     }
@@ -184,6 +187,9 @@ pub fn start(app: &AppHandle, state: &AppState) -> Result<(), String> {
 }
 
 pub fn stop(state: &AppState) -> Result<(), String> {
+    if crate::compute::running() {
+        return Err("PC compute is running and owns the GPU server. Stop PC compute instead.".into());
+    }
     let port = state.config.lock().unwrap().llm_port;
     let pid = listener_pid(port).ok_or_else(|| format!("Nothing is listening on port {port}"))?;
     let mut sys = System::new().map_err(|e| e.to_string())?;
@@ -229,10 +235,8 @@ pub fn llm_stop(state: State<AppState>) -> Result<(), String> {
     stop(&state)
 }
 
-#[tauri::command(async)]
-pub fn llm_log_tail(app: AppHandle, lines: usize) -> Result<String, String> {
-    let path = log_path(&app)?;
-    let Ok(mut f) = File::open(&path) else {
+pub(crate) fn tail(path: &PathBuf, lines: usize) -> Result<String, String> {
+    let Ok(mut f) = File::open(path) else {
         return Ok(String::new());
     };
     let len = f.metadata().map_err(|e| e.to_string())?.len();
@@ -242,6 +246,11 @@ pub fn llm_log_tail(app: AppHandle, lines: usize) -> Result<String, String> {
     let text = redact(&String::from_utf8_lossy(&buf));
     let all: Vec<&str> = text.lines().collect();
     Ok(all[all.len().saturating_sub(lines.clamp(1, 2000))..].join("\n"))
+}
+
+#[tauri::command(async)]
+pub fn llm_log_tail(app: AppHandle, lines: usize) -> Result<String, String> {
+    tail(&log_path(&app)?, lines)
 }
 
 #[cfg(test)]
@@ -310,6 +319,9 @@ mod tests {
         assert!(r.contains("LLM_REMOTE_KEY=*** ok"));
         assert!(r.contains("--api-key *** --no-webui"));
         assert!(r.contains("plain line"));
+        let t = redact("env SAVED_TOKEN=tok123 x\nAuthorization: Bearer tok456 ok");
+        assert!(!t.contains("tok123") && !t.contains("tok456"));
+        assert!(t.contains("SAVED_TOKEN=*** x") && t.contains("Bearer *** ok"));
     }
 
     #[test]

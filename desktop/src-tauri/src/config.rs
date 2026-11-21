@@ -11,6 +11,7 @@ pub struct Config {
     pub pcllm_dir: String,
     pub llm_port: u16,
     pub autostart_llm: bool,
+    pub autostart_compute: bool,
     pub close_to_tray: bool,
     pub last_view: String,
 }
@@ -22,6 +23,7 @@ impl Default for Config {
             pcllm_dir: String::new(),
             llm_port: 8099,
             autostart_llm: false,
+            autostart_compute: false,
             close_to_tray: true,
             last_view: "dashboard".into(),
         }
@@ -118,4 +120,35 @@ pub fn token_set(token: String) -> Result<(), String> {
 
 fn entry() -> Result<keyring::Entry, String> {
     keyring::Entry::new("Saved", "session").map_err(|e| format!("Credential Manager: {e}"))
+}
+
+fn compute_entry() -> Result<keyring::Entry, String> {
+    keyring::Entry::new("Saved", "compute_token").map_err(|e| format!("Credential Manager: {e}"))
+}
+
+pub fn compute_token() -> Result<Option<String>, String> {
+    match compute_entry()?.get_password() {
+        Ok(t) => Ok(Some(t)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => Err(format!("Credential Manager: {e}")),
+    }
+}
+
+#[tauri::command]
+pub fn compute_token_set(token: String) -> Result<(), String> {
+    let token = token.trim();
+    if token.is_empty() {
+        return Err("Empty agent token".into());
+    }
+    compute_entry()?
+        .set_password(token)
+        .map_err(|e| format!("Credential Manager: {e}"))
+}
+
+#[tauri::command]
+pub fn compute_token_clear() -> Result<(), String> {
+    match compute_entry()?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(format!("Credential Manager: {e}")),
+    }
 }

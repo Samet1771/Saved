@@ -7,6 +7,7 @@ export const app = {
   authError: false,
   everConnected: false,
   llm: null,
+  compute: null,
   gpu: undefined,
   events: [],
   lastEventId: 0,

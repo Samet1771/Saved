@@ -4,6 +4,7 @@ import { startStream } from './stream.js';
 import { startPolling } from './poll.js';
 import { initNotify } from './notify.js';
 import { initTray } from './tray.js';
+import { initCompute, toggleCompute } from './compute.js';
 import { putWorker } from './api.js';
 import { applyStatus } from './stream.js';
 import { h, icon, toast, ago } from './util.js';
@@ -95,6 +96,7 @@ async function boot() {
   for (const v of VIEWS) v.mod.init(document.getElementById(`v-${v.id}`));
   initNotify();
   initTray();
+  initCompute();
 
   on('conn', updateBanner);
   on('config', () => {
@@ -113,7 +115,10 @@ async function boot() {
       showView(v.id);
     }
   });
-  native.onTrayAction((a) => { if (a === 'toggle-worker') toggleWorker(); });
+  native.onTrayAction((a) => {
+    if (a === 'toggle-worker') toggleWorker();
+    else if (a === 'toggle-compute') toggleCompute();
+  });
 
   const known = VIEWS.some((v) => v.id === app.config.last_view);
   showView(configured() && known ? app.config.last_view : configured() ? 'dashboard' : 'settings');

@@ -66,6 +66,7 @@ export async function login(url, username, password) {
 export const logout = () => call('POST', '/logout').catch(() => {});
 export const testConnection = (url, token) => request(base(url), token.trim(), 'GET', '/status');
 export const getItem = (id) => call('GET', `/items/${id}`);
+export const createAgentToken = () => call('POST', '/tokens', { label: 'PC compute' });
 export const putWorker = (body) => call('PUT', '/worker', body);
 export const retryFailed = (includeSkipped) => call('POST', '/items/retry-failed', { include_skipped: includeSkipped });
 export const retryItem = (id) => call('POST', `/items/${id}/retry`);

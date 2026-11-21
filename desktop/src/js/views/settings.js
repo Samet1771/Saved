@@ -1,7 +1,8 @@
-import { app, emit } from '../state.js';
+import { app, emit, on } from '../state.js';
 import { native } from '../native.js';
 import { login, logout, testConnection } from '../api.js';
-import { h, toast, guarded } from '../util.js';
+import { resetComputeToken } from '../compute.js';
+import { h, toast, guarded, confirmDialog } from '../util.js';
 
 export function init(root) {
   const url = h('input', { class: 'input', type: 'url', placeholder: 'http://192.168.1.10:8080', spellcheck: false, autocomplete: 'off', 'aria-label': 'Server URL' });
@@ -15,6 +16,9 @@ export function init(root) {
   const dirHint = h('span', { class: 'hint' });
   const port = h('input', { class: 'input', type: 'number', min: 1, max: 65535, 'aria-label': 'LLM port' });
   const autostart = h('input', { type: 'checkbox' });
+  const autostartCompute = h('input', { type: 'checkbox' });
+  const autostartComputeRow = h('label', { class: 'check', hidden: true }, autostartCompute, 'Start PC compute when the app starts');
+  const resetToken = h('button', { class: 'btn', hidden: true }, 'Reset agent token');
   const tray = h('input', { type: 'checkbox' });
   const save = h('button', { class: 'btn primary' }, 'Save');
   const clear = h('button', { class: 'btn ghost danger' }, 'Sign out');
@@ -30,6 +34,8 @@ export function init(root) {
       h('div', { class: 'field' }, h('span', null, 'Path to tools/pc-llm'), dir, dirHint),
       h('div', { class: 'field' }, h('span', null, 'LLM port'), port),
       h('label', { class: 'check' }, autostart, 'Start the GPU server when the app starts'),
+      autostartComputeRow,
+      h('div', { class: 'actions' }, resetToken),
       h('label', { class: 'check' }, tray, 'Close to tray (keep running in the background)'),
       h('div', { class: 'actions' }, save)));
 
@@ -40,6 +46,7 @@ export function init(root) {
     dir.value = c.pcllm_dir;
     port.value = c.llm_port;
     autostart.checked = c.autostart_llm;
+    autostartCompute.checked = c.autostart_compute;
     tray.checked = c.close_to_tray;
     pass.value = '';
     signedIn.textContent = app.token
@@ -47,8 +54,27 @@ export function init(root) {
       : 'Not signed in.';
     clear.hidden = !app.token;
     testBtn.hidden = !app.token;
+    syncHybrid();
     dirHint.textContent = c.pcllm_dir ? '' : 'Needed to start the GPU server from here. It holds start-llm.ps1.';
   }
+
+  const syncHybrid = () => {
+    const hybrid = app.status?.compute?.mode === 'hybrid';
+    autostartComputeRow.hidden = !hybrid;
+    resetToken.hidden = !hybrid || !app.token;
+  };
+
+  resetToken.onclick = async () => {
+    if (!(await confirmDialog('Reset the agent token?', 'A new token is created on the server and stored in Windows Credential Manager. A running agent restarts with it.', 'Reset'))) return;
+    guarded(resetToken, async () => {
+      try {
+        await resetComputeToken();
+        toast('Agent token reset', 'ok');
+      } catch (e) {
+        toast(String(e), 'err');
+      }
+    });
+  };
 
   const showResult = (ok, text) => {
     result.className = 'hint';
@@ -107,6 +133,7 @@ export function init(root) {
         pcllm_dir: dir.value,
         llm_port: port_,
         autostart_llm: autostart.checked,
+        autostart_compute: autostartCompute.checked,
         close_to_tray: tray.checked,
       });
       app.config = next;
@@ -135,5 +162,6 @@ export function init(root) {
     if (e.key !== 'Enter' || e.target.tagName !== 'INPUT' || e.target.type === 'checkbox') return;
     (e.target === user || e.target === pass ? signIn : save).click();
   });
+  on('status', syncHybrid);
   fill();
 }

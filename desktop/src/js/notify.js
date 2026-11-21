@@ -5,6 +5,7 @@ const COOLDOWN = {
   offline: 10 * 60 * 1000,
   online: 10 * 60 * 1000,
   gpu: 10 * 60 * 1000,
+  compute: 10 * 60 * 1000,
   done: 60 * 60 * 1000,
 };
 const last = {};
@@ -21,6 +22,7 @@ const remaining = (s) => Object.values(s?.progress || {}).reduce((n, p) => n + (
 
 let toldOffline = false;
 let wasRunning = null;
+let computeWasRunning = null;
 let lastRemaining = null;
 
 export function initNotify() {
@@ -39,6 +41,14 @@ export function initNotify() {
       send('gpu', 'GPU server stopped', 'llama-server stopped unexpectedly. Tagging will wait until it is started again.');
     }
     wasRunning = running;
+  });
+
+  on('compute', () => {
+    const running = Boolean(app.compute?.running);
+    if (computeWasRunning && !running && !app.compute.user_stopped) {
+      send('compute', 'PC compute stopped', 'The compute agent stopped unexpectedly. Processing will wait until it is started again.');
+    }
+    computeWasRunning = running;
   });
 
   on('status', (s) => {
